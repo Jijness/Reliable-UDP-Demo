@@ -20,38 +20,40 @@ public class LossyChannel {
     private final double lossRate, corruptRate;
     private final int maxDelayMs;
     private final Random rnd = new Random();
-    private final ScheduledExecutorService executor = Executors.newScheduledThreadPool(4);
+    private final ScheduledExecutorService executor = Executors.newScheduledThreadPool(8);
 
     public LossyChannel(DatagramSocket socket, double lossRate, double corruptRate, int maxDelayMs) {
         this.socket = socket;
-        this.lossRate = lossRate;
-        this.corruptRate = corruptRate;
-        this.maxDelayMs = maxDelayMs;
+        this.lossRate = Math.max(0.0, Math.min(0.5, lossRate));
+        this.corruptRate = Math.max(0.0, Math.min(0.5, corruptRate));
+        this.maxDelayMs = Math.max(0, maxDelayMs);
     }
     public void send(DatagramPacket packet) {
-        // Chọn tỉ lệ drop
         double d = rnd.nextDouble();
-        if(d < lossRate) {
+        if (d < lossRate) {
             Utils.log("LossyChannel: DROPPED packet to " + packet.getAddress() + ":" + packet.getPort());
             return;
         }
-        // Nếu corrupt
         byte[] data = packet.getData();
-        int offset= packet.getOffset(), len =  packet.getLength();
+        int offset = packet.getOffset();
+        int len = packet.getLength();
         byte[] copy = new byte[len];
         System.arraycopy(data, offset, copy, 0, len);
-        if(rnd.nextDouble() < corruptRate && len > 0) {
-            int index = rnd.nextInt(len);
-            copy[index] ^= 0xFF; // flip bits
-            Utils.log("LossyChannel: CORRUPTED packet (index="+ index +")");
+
+        // Không corrupt header RUDP (8 bytes). Nếu gói ngắn hơn 8 thì vẫn corrupt payload.
+        int protectedHeader = Math.min(8, len);
+        if (rnd.nextDouble() < corruptRate && len > protectedHeader) {
+            int idx = protectedHeader + rnd.nextInt(len - protectedHeader);
+            copy[idx] ^= (byte) (rnd.nextInt(256) & 0xFF);
+            Utils.log("LossyChannel: CORRUPTED packet (index=" + idx + ")");
         }
-        // Delay
-        int delay = maxDelayMs > 0 ? rnd.nextInt(maxDelayMs) : 0;
+
+        int delay = maxDelayMs > 0 ? rnd.nextInt(maxDelayMs + 1) : 0;
         executor.schedule(() -> {
-            try{
-                DatagramPacket packet2 = new DatagramPacket(copy, copy.length, packet.getAddress(), packet.getPort());
-                socket.send(packet2);
-            }catch(Exception e){
+            try {
+                DatagramPacket p2 = new DatagramPacket(copy, copy.length, packet.getAddress(), packet.getPort());
+                socket.send(p2);
+            } catch (Exception e) {
                 e.printStackTrace();
             }
         }, delay, TimeUnit.MILLISECONDS);

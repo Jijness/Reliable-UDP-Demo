@@ -11,13 +11,11 @@ import Channel.Utils;
 
 import java.io.IOException;
 import java.net.*;
+import java.nio.ByteBuffer;
 import java.util.*;
 import java.util.concurrent.*;
 
 public class ReliableServer {
-    // THAM SỐ MẶC ĐỊNH
-    private static final String DEFAULT_HOST = "127.0.0.1";
-    private static final int DEFAULT_PORT = 5000;
     // cấu hình
     private static final int SEGMENT_SIZE = 1000; // payload size per packet
     private static final int WINDOW_SIZE = 16;
@@ -28,71 +26,56 @@ public class ReliableServer {
     private InetAddress clientAddr;
     private int clientPort;
     private final int serverPort;
-    private DatagramSocket socket;
+    private final DatagramSocket socket;
     private LossyChannel channel;
 
-    private final Map<Long, ReliablePacket> segments = new ConcurrentHashMap<>();
-    private final Map<Long, ScheduledFuture<?>> timers = new ConcurrentHashMap<>();
-    private final Set<Long> acked = Collections.synchronizedSet(new HashSet<>());
-    private final Map<Long, Integer> dupAckCounts = new ConcurrentHashMap<>();
-    private final ScheduledExecutorService timerExec = Executors.newScheduledThreadPool(4);
+    private final Map<Integer, ReliablePacket> segments = new ConcurrentHashMap<>();
+    private final Map<Integer, ScheduledFuture<?>> timers = new ConcurrentHashMap<>();
+    private final Set<Integer> acked = Collections.synchronizedSet(new HashSet<>());
+    private final Map<Integer, Integer> dupAckCounts = new ConcurrentHashMap<>();
+    private final ScheduledExecutorService timerExec = Executors.newScheduledThreadPool(8);
 
-    private long baseSeq = 1;
-    private long nextSeq = 1;
-    private long maxSeq = 0;
+    private int baseSeq = 1;
+    private int nextSeq = 1;
+    private int maxSeq = 0;
 
     // statistics
     private int sentCount = 0;
     private int retransCount = 0;
-
-    // Server chờ yêu cầu (Waiting State)
-    private boolean waitForRequest(String filePath, double lossRate) throws IOException {
-        Utils.log("Server: Listening on port " + serverPort + " for REQUEST (RUDP)...");
-        byte[] buf = new byte[1500];
-        DatagramPacket dp = new DatagramPacket(buf, buf.length);
-
-        // Chờ gói Request
-        while(true) {
-            try {
-                socket.setSoTimeout(0); // Chờ vô thời hạn
-                socket.receive(dp);
-                ReliablePacket rp = ReliablePacket.fromBytes(dp.getData(), dp.getLength());
-
-                if ((rp.flags & ReliablePacket.FLAG_REQ) != 0) {
-                    this.clientAddr = dp.getAddress();
-                    this.clientPort = rp.aux16; // Client gửi port nghe của nó trong aux16
-
-                    // KHỞI TẠO LOSSY CHANNEL SAU KHI CÓ ĐỊA CHỈ CLIENT
-                    // Tắt Corruption (0.0)
-                    this.channel = new LossyChannel(socket, lossRate, 0.0, 50);
-
-                    Utils.log("Server: Received REQUEST from " + clientAddr + ":" + dp.getPort() +
-                            ". Sending DATA to port " + clientPort + ".");
-                    return true;
-                } else {
-                    Utils.log("Server: Received unknown packet. Ignoring.");
-                }
-            } catch (SocketTimeoutException ignored) {
-                // Sẽ không xảy ra vì timeout = 0
-            }
-        }
-    }
 
     public ReliableServer(int serverPort) throws SocketException {
         this.serverPort = serverPort;
         this.socket = new DatagramSocket(serverPort);
     }
 
-    public ReliableServer(String clientHost, int clientPort, int serverPort, double lossRate) throws UnknownHostException, SocketException {
-        this.clientAddr = InetAddress.getByName(clientHost);
-        this.clientPort = clientPort;
-        this.serverPort = serverPort;
-        this.socket = new DatagramSocket(serverPort); // Listen ACKs here
-        this.channel = new LossyChannel(socket, lossRate, 0.01, 50); // small corrupt, small delay
+    // Server chờ yêu cầu (Waiting State)
+    private boolean waitForRequest(double lossRate) throws IOException {
+        Utils.log("Server: Listening on port " + serverPort + " for REQUEST (RUDP)...");
+        byte[] buf = new byte[1500];
+        DatagramPacket dp = new DatagramPacket(buf, buf.length);
+
+        while (true) {
+            socket.receive(dp);
+            try {
+                ReliablePacket rp = ReliablePacket.fromBytes(dp.getData(), dp.getLength());
+                if ((rp.flags & ReliablePacket.FLAG_REQ) != 0) {
+                    this.clientAddr = dp.getAddress();
+                    this.clientPort = dp.getPort(); // client bound socket port
+                    // init channel (disable header corruption)
+                    this.channel = new LossyChannel(socket, lossRate, 0.0, 50);
+                    Utils.log("Server: Received REQUEST from " + clientAddr + ":" + clientPort + ". Sending DATA.");
+                    return true;
+                } else {
+                    Utils.log("Server: Received non-REQ packet while waiting. Ignoring.");
+                }
+            } catch (IllegalArgumentException ignored) {
+                // ignore short/invalid packets
+            }
+        }
     }
 
     public void sendFile(String filePath, double lossRate) throws IOException, InterruptedException {
-        if (!waitForRequest(filePath, lossRate)) return; // Chờ yêu cầu từ Client
+        if (!waitForRequest(lossRate)) return;
 
         byte[] data = Utils.readFile(filePath);
         int total = data.length;
@@ -100,43 +83,42 @@ public class ReliableServer {
 
         // slice into segments
         int idx = 0;
-        long seq = 1;
+        int seq = 1;
         while (idx < total) {
             int len = Math.min(SEGMENT_SIZE, total - idx);
             byte[] seg = Arrays.copyOfRange(data, idx, idx + len);
-            ReliablePacket p = ReliablePacket.createData(seq, seg, 2);
+            ReliablePacket p = ReliablePacket.createData(seq, seg, 0);
             segments.put(seq, p);
             idx += len;
             seq++;
         }
         maxSeq = seq - 1;
         Utils.log("Server: total segments=" + maxSeq);
-
-        // start thread to receive ACKs
+        // start ACK listener
         Thread ackThread = new Thread(this::receiveAcks, "ACK-Listener");
+        ackThread.setDaemon(true);
         ackThread.start();
 
+        long start = System.currentTimeMillis();
         // main sending loop
         while (baseSeq <= maxSeq) {
             synchronized (this) {
-                while (nextSeq < baseSeq + WINDOW_SIZE && nextSeq <= maxSeq) {
+                while (nextSeq <= maxSeq && nextSeq < baseSeq + WINDOW_SIZE) {
                     sendSegment(nextSeq, false);
                     nextSeq++;
                 }
             }
-            try { Thread.sleep(5); } catch (InterruptedException ignored) {}
+            // give CPU to other thread
+            Thread.sleep(5);
         }
-
-        // Gửi FIN khi hoàn thành
-        sendFin();
-
-        // Đợi ACK thread kết thúc trước khi đóng
-        ackThread.join(2000);
-
+        long end = System.currentTimeMillis();
         Utils.log("Server: all segments acked. sent=" + sentCount + " retrans=" + retransCount);
-        Utils.log(String.format("Retransmission Rate: %.2f%%", (double)retransCount / sentCount * 100));
-        channel.shutdown();
+        Utils.log(String.format("Time taken: %.2f s", (end - start) / 1000.0));
+        // send FIN packet (ACK with FIN flag)
+        sendFin();
+        // cleanup
         timerExec.shutdownNow();
+        channel.shutdown();
         socket.close();
     }
 
@@ -145,28 +127,13 @@ public class ReliableServer {
         fin.flags = (byte) (fin.flags | ReliablePacket.FLAG_FIN);
         byte[] buf = fin.toBytes();
         DatagramPacket dp = new DatagramPacket(buf, buf.length, clientAddr, clientPort);
-
-        // Gửi FIN segment 3 lần
         for (int i = 0; i < 3; i++) {
             channel.send(dp);
             try { Thread.sleep(RTO_MS); } catch (InterruptedException ignored) {}
         }
         Utils.log("Server: Sent FIN segments.");
     }
-
-    public static void main(String[] args) throws IOException, InterruptedException {
-        String filePath = "data_source.txt"; // File đầu vào
-        double loss = 0.1; // Tỉ lệ mất gói mặc định 10%
-        int serverPort = 5000; // Port mặc định
-
-        System.out.println("--- RUDP Server (Tự động) ---");
-        System.out.println(String.format("File: %s, Loss: %.1f, Port: %d", filePath, loss, serverPort));
-
-        ReliableServer server = new ReliableServer(serverPort);
-        server.sendFile(filePath, loss);
-    }
-
-    private void sendSegment(long seq, boolean isRetransmit) {
+    private void sendSegment(int seq, boolean isRetransmit) {
         ReliablePacket p = segments.get(seq);
         if (p == null) return;
         byte[] buf = p.toBytes();
@@ -179,64 +146,96 @@ public class ReliableServer {
         ScheduledFuture<?> old = timers.get(seq);
         if (old != null) old.cancel(false);
         ScheduledFuture<?> fut = timerExec.schedule(() -> {
-            // timeout -> retransmit
             Utils.log("RTO: retransmit seq=" + seq);
             sendSegment(seq, true);
         }, RTO_MS, TimeUnit.MILLISECONDS);
         timers.put(seq, fut);
     }
+
     private void receiveAcks() {
         byte[] buf = new byte[1500];
         DatagramPacket dp = new DatagramPacket(buf, buf.length);
+
         while (!socket.isClosed()) {
             try {
                 socket.setSoTimeout(500);
                 socket.receive(dp);
-
                 ReliablePacket rp = ReliablePacket.fromBytes(dp.getData(), dp.getLength());
-                int type = rp.getType();
-                if (type == ReliablePacket.TYPE_ACK) {
-                    long acknum = rp.seqOrAck;
+                if (rp.getType() != ReliablePacket.TYPE_ACK) continue;
 
-                    synchronized (this) {
-                        // 1. Xử lý ACK trùng lặp (Fast Retransmit Hint): Chỉ đếm ACK = baseSeq - 1
-                        if (acknum == baseSeq - 1) {
-                            // Gói tin ACK lũy tiến cũ đến. Đây là dấu hiệu gói tin baseSeq bị mất.
-                            dupAckCounts.put(baseSeq, dupAckCounts.getOrDefault(baseSeq, 0) + 1);
-                            if (dupAckCounts.get(baseSeq) == DUP_ACK_THRESHOLD) {
-                                Utils.log("FAST RETRANSMIT: Retransmitting seq=" + baseSeq);
-                                sendSegment(baseSeq, true);
-                                dupAckCounts.put(baseSeq, 0); // Reset bộ đếm sau khi kích hoạt retransmit
-                            }
-                            return;
+                int acknum = rp.seqOrAck;
+
+                // verify ACK checksum: compute checksum over (type + seq)
+                ByteBuffer bb = ByteBuffer.allocate(5);
+                bb.put((byte) ReliablePacket.TYPE_ACK);
+                bb.putInt(acknum);
+                int expect = Utils.udpChecksum16(bb.array(), 0, bb.position());
+                if (((rp.checksum & 0xFFFF) != expect)) {
+                    Utils.log("Server: Bad ACK checksum for seq=" + acknum + " -> ignore");
+                    continue;
+                }
+
+                synchronized (this) {
+                    // duplicate ack detection (ack for base-1)
+                    if (acknum == baseSeq - 1 && baseSeq > 1) {
+                        dupAckCounts.put(baseSeq, dupAckCounts.getOrDefault(baseSeq, 0) + 1);
+                        if (dupAckCounts.get(baseSeq) >= DUP_ACK_THRESHOLD) {
+                            Utils.log("FAST RETRANSMIT: Retransmitting seq=" + baseSeq);
+                            sendSegment(baseSeq, true);
+                            dupAckCounts.put(baseSeq, 0);
                         }
+                        continue;
+                    }
 
-                        // 2. Xử lý ACK lũy tiến MỚI (acknum >= baseSeq)
-                        if (acknum >= baseSeq) {
-                            // Xử lý các gói đã được ACK thành công
-                            for (long s = baseSeq; s <= acknum; s++) {
-                                if (segments.containsKey(s)) {
-                                    acked.add(s);
-                                    ScheduledFuture<?> f = timers.remove(s);
-                                    if (f != null) f.cancel(false);
-                                }
-                            }
-
-                            // Trượt cửa sổ (Slide base)
-                            while (acked.contains(baseSeq)) {
-                                segments.remove(baseSeq);
-                                baseSeq++;
-                            }
-
-                            dupAckCounts.clear(); // Reset toàn bộ bộ đếm khi window trượt
+                    // mark the acked packet (selective)
+                    if (acknum >= 1 && acknum <= maxSeq) {
+                        if (!acked.contains(acknum)) {
+                            acked.add(acknum);
+                            ScheduledFuture<?> f = timers.remove(acknum);
+                            if (f != null) f.cancel(false);
                         }
                     }
+
+                    // slide base while consecutive acked
+                    while (acked.contains(baseSeq)) {
+                        acked.remove(baseSeq);
+                        segments.remove(baseSeq);
+                        baseSeq++;
+                    }
+
+                    // If ack indicates progress beyond missing items, do selective retransmit
+                    // Retransmit any missing seqs within current window up to the highest ack seen (acknum)
+                    if (acknum >= baseSeq) {
+                        int windowEnd = Math.min(baseSeq + WINDOW_SIZE - 1, maxSeq);
+                        for (int s = baseSeq; s <= windowEnd; s++) {
+                            if (!acked.contains(s)) {
+                                Utils.log("SELECTIVE-RETX: retransmit seq=" + s);
+                                sendSegment(s, true);
+                            }
+                        }
+                    }
+
+                    // clear dup counters if window moved
+                    dupAckCounts.clear();
                 }
+
             } catch (SocketTimeoutException ignored) {
-                // Timeout, tiếp tục vòng lặp để chờ ACK
+                // continue
             } catch (Exception e) {
                 if (!socket.isClosed()) e.printStackTrace();
             }
         }
+    }
+    public static void main(String[] args) throws Exception {
+        // Hardcoded: server listens on 5000, file "data_source.txt", default loss 10%
+        int serverPort = 5000;
+        String filePath = "data_source.txt";
+        double loss = 0.10;
+
+        System.out.println("--- RUDP Server ---");
+        System.out.println(String.format("File: %s, Loss: %.2f, ServerPort: %d", filePath, loss, serverPort));
+
+        ReliableServer server = new ReliableServer(serverPort);
+        server.sendFile(filePath, loss);
     }
 }

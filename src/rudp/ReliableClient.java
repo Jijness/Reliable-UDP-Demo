@@ -10,6 +10,7 @@ package rudp;
 
 import Channel.Utils;
 
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
@@ -19,9 +20,6 @@ import java.util.Map;
 import java.util.TreeMap;
 
 public class ReliableClient {
-    // THAM SỐ MẶC ĐỊNH
-    private static final String DEFAULT_HOST = "127.0.0.1";
-    private static final int DEFAULT_PORT = 5000;
 
     private final int listenPort;
     private final String outFile;
@@ -29,8 +27,8 @@ public class ReliableClient {
     private final int serverPort;
     private final DatagramSocket socket;
 
-    private long expectedSeq = 1;
-    private final Map<Long, byte[]> buffer = new TreeMap<>(); // store out-of-order
+    private int expectedSeq = 1;
+    private final Map<Integer, byte[]> buffer = new TreeMap<>();
     private boolean receivedFin = false;
 
     public ReliableClient(int listenPort, String outFile, String serverHost, int serverPort) throws Exception {
@@ -45,7 +43,6 @@ public class ReliableClient {
         ReliablePacket req = ReliablePacket.createRequest(listenPort);
         byte[] data = req.toBytes();
         DatagramPacket dp = new DatagramPacket(data, data.length, serverAddr, serverPort);
-
         // Gửi 3 lần để đảm bảo Request đến nơi
         for(int i = 0; i < 3; i++) {
             socket.send(dp);
@@ -55,14 +52,11 @@ public class ReliableClient {
     }
 
     public void startReceiving() throws IOException {
-        // Bắt tay khởi tạo: Gửi Request trước khi nghe
+        Utils.clearFile(outFile);
         sendRequest();
-
         Utils.log("Client: Listening on port " + listenPort + " for DATA...");
-
         byte[] buf = new byte[1500];
         DatagramPacket dp = new DatagramPacket(buf, buf.length);
-
         long startTime = System.currentTimeMillis();
         long totalBytes = 0;
 
@@ -73,56 +67,61 @@ public class ReliableClient {
                 Utils.log("Client: Server closed connection unexpectedly.");
                 break;
             }
-
-            ReliablePacket rp = ReliablePacket.fromBytes(dp.getData(), dp.getLength());
-
-            // Xử lý FIN Segment
+            ReliablePacket rp;
+            try {
+                rp = ReliablePacket.fromBytes(dp.getData(), dp.getLength());
+            } catch (IllegalArgumentException iae) {
+                continue;
+            }
+            // FIN
             if ((rp.flags & ReliablePacket.FLAG_FIN) != 0) {
-                long finalAck = expectedSeq - 1;
+                int finalAck = expectedSeq - 1;
                 Utils.log("Client: Received FIN. Sending final ACK " + finalAck + " and terminating.");
                 sendAck(finalAck);
                 receivedFin = true;
                 break;
             }
-
             if (rp.getType() == ReliablePacket.TYPE_DATA) {
-                long seq = rp.seqOrAck;
-
+                int seq = rp.seqOrAck;
+                // verify payload checksum
+                int expectChk = Utils.udpChecksum16(rp.payload, 0, rp.payload.length);
+                if ((rp.checksum & 0xFFFF) != expectChk) {
+                    Utils.log("Client: DATA checksum mismatch seq=" + seq + " -> ignore");
+                    continue;
+                }
+                // duplicate (already delivered)
                 if (seq < expectedSeq) {
-                    // Gói tin trùng lặp: Gửi lại ACK lũy tiến cũ (Hint cho Fast Retransmit)
+                    // send ACK for already-received (helps fast-retransmit on sender)
                     sendAck(expectedSeq - 1);
                     continue;
                 }
-
-                // Lưu vào buffer và xử lý gói tin ngoài thứ tự
-                if (!buffer.containsKey(seq)) {
-                    buffer.put(seq, rp.payload);
-                    totalBytes += rp.payload.length;
+                // if inside window, buffer it
+                if (seq >= expectedSeq && seq < expectedSeq + ReliablePacket.WINDOW_SIZE) {
+                    if (!buffer.containsKey(seq)) {
+                        buffer.put(seq, rp.payload);
+                        totalBytes += rp.payload.length;
+                    }
+                } else {
+                    // outside window (too far) -> ignore
+                    continue;
                 }
-
-                // Nếu là gói ngoài thứ tự, gửi ACK lũy tiến cũ để báo hiệu gói bị mất
-                if (seq > expectedSeq) {
-                    sendAck(expectedSeq - 1); // Gửi ACK N-1 để kích hoạt Fast Retransmit ở Server
-                }
-
+                // send selective ACK for this packet
+                sendAck(seq);
                 // flush contiguous
-                int flushedCount = 0;
-                while (buffer.containsKey(expectedSeq)) {
-                    byte[] chunk = buffer.remove(expectedSeq);
-                    Utils.appendToFile(outFile, chunk);
-                    expectedSeq++;
-                    flushedCount++;
+                boolean flushed = false;
+                try (FileOutputStream fos = new FileOutputStream(outFile, true)) {
+                    while (buffer.containsKey(expectedSeq)) {
+                        byte[] chunk = buffer.remove(expectedSeq);
+                        fos.write(chunk);
+                        expectedSeq++;
+                        flushed = true;
+                    }
                 }
-
-                // Gửi ACK lũy tiến MỚI nếu có gói tin được flush
-                if (flushedCount > 0) {
-                    sendAck(expectedSeq - 1);
-                }
+                // optionally send cumulative ACK after flush to help sender advance
+                if (flushed) sendAck(expectedSeq - 1);
             }
         }
-
         socket.close();
-
         long endTime = System.currentTimeMillis();
         Utils.log("--- TRANSFER SUMMARY (RUDP) ---");
         Utils.log(String.format("File received: %s", outFile));
@@ -131,15 +130,15 @@ public class ReliableClient {
         Utils.log("-------------------------------");
     }
 
-    private void sendAck(long ackNum) {
+    private void sendAck(int ackNum) {
         ReliablePacket ack = ReliablePacket.createAck(ackNum);
         byte[] data = ack.toBytes();
         try {
             DatagramPacket dp = new DatagramPacket(data, data.length, serverAddr, serverPort);
             socket.send(dp);
+            Utils.log("Client: sent ACK " + ackNum);
         } catch (IOException ignored) {}
     }
-
 
     public static void main(String[] args) throws Exception {
         String outFile = "received_rudp.txt"; // File đầu ra
@@ -147,7 +146,7 @@ public class ReliableClient {
         String serverHost = "127.0.0.1";
         int serverPort = 5000; // Server lắng nghe trên port 5000
 
-        System.out.println("--- RUDP Client (Tự động) ---");
+        System.out.println("--- RUDP Client ---");
         System.out.println(String.format("Out File: %s, Listen Port: %d, Server: %s:%d", outFile, listenPort, serverHost, serverPort));
 
         ReliableClient client = new ReliableClient(listenPort, outFile, serverHost, serverPort);
