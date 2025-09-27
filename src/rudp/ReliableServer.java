@@ -78,8 +78,9 @@ public class ReliableServer {
         }
     }
 
-    public ReliableServer(int serverPort) {
+    public ReliableServer(int serverPort) throws SocketException {
         this.serverPort = serverPort;
+        this.socket = new DatagramSocket(serverPort);
     }
 
     public ReliableServer(String clientHost, int clientPort, int serverPort, double lossRate) throws UnknownHostException, SocketException {
@@ -155,7 +156,7 @@ public class ReliableServer {
 
     public static void main(String[] args) throws IOException, InterruptedException {
         String filePath = "data_source.txt"; // File đầu vào
-        double loss = 0.3; // Tỉ lệ mất gói mặc định 30%
+        double loss = 0.1; // Tỉ lệ mất gói mặc định 10%
         int serverPort = 5000; // Port mặc định
 
         System.out.println("--- RUDP Server (Tự động) ---");
@@ -199,7 +200,7 @@ public class ReliableServer {
 
                     synchronized (this) {
                         // 1. Xử lý ACK trùng lặp (Fast Retransmit Hint): Chỉ đếm ACK = baseSeq - 1
-                        if (acknum == baseSeq - 1 && baseSeq > 1) {
+                        if (acknum == baseSeq - 1) {
                             // Gói tin ACK lũy tiến cũ đến. Đây là dấu hiệu gói tin baseSeq bị mất.
                             dupAckCounts.put(baseSeq, dupAckCounts.getOrDefault(baseSeq, 0) + 1);
                             if (dupAckCounts.get(baseSeq) == DUP_ACK_THRESHOLD) {

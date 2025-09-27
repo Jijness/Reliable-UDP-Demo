@@ -98,10 +98,10 @@ public class Server {
     public static void main(String[] args) throws Exception {
         // Usage: java udp.Server <filePath> [lossRate] [serverPort]
         String file = "data_source.txt"; // File đầu vào
-        double loss = 0.3; // Tỉ lệ mất gói mặc định 30%
+        double loss = 0.1; // Tỉ lệ mất gói mặc định 10%
         int serverPort = 5002; // Port mặc định
 
-        System.out.println("--- UDP Server (Tự động) ---");
+        System.out.println("--- UDP Server ---");
         System.out.println(String.format("File: %s, Loss: %.1f, Port: %d", file, loss, serverPort));
 
         Server s = new Server(serverPort);

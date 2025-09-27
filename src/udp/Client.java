@@ -82,11 +82,21 @@ public class Client {
                     if (seq > highestSeq) highestSeq = seq;
                 }
 
-                // flush contiguous to file
-                flushToFile();
             } catch (java.net.SocketTimeoutException st) {
                 Utils.log("UDP Client: timeout waiting. stopping receive.");
                 break;
+            }
+        }
+        // GHI TOÀN BỘ DỮ LIỆU ĐÃ NHẬN (KỂ CẢ CÁC GÓI BỊ MẤT GIỮA CHỪNG)
+        // Sẽ tạo ra 1 file KHÔNG LIÊN TỤC (có thể thiếu/lỗi), nhưng phản ánh đúng số byte nhận được
+        try (FileOutputStream fos = new FileOutputStream(outFile)) { // Không dùng append (false)
+            int maxSeq = highestSeq;
+            Utils.log("UDP Client: Writing all received data to file...");
+            for (int seq = 1; seq <= maxSeq; seq++) {
+                byte[] chunk = buffer.get(seq);
+                if (chunk != null) {
+                    fos.write(chunk);
+                }
             }
         }
         socket.close();
@@ -102,18 +112,6 @@ public class Client {
         Utils.log("Approx. Loss Count: " + lossCount);
         Utils.log(String.format("Time taken: %.2f s", (endTime - startTime) / 1000.0));
         Utils.log("----------------------------");
-    }
-
-    private void flushToFile() throws IOException {
-        // write from seq=1 upward contiguous.
-        try (FileOutputStream fos = new FileOutputStream(outFile, true)) {
-            int expect = 1;
-            while (buffer.containsKey(expect)) {
-                byte[] chunk = buffer.remove(expect);
-                fos.write(chunk);
-                expect++;
-            }
-        }
     }
 
     public static void main(String[] args) throws Exception {
