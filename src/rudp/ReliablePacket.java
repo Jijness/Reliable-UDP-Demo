@@ -17,6 +17,7 @@ public class ReliablePacket {
     public static final int FLAG_ACK = 1 << 4;
     public static final int FLAG_DATA = 1 << 3;
     public static final int FlAG_SACK_PRESENT = 1 << 2;
+    public static final int FLAG_REQ = 1 << 1; // Cờ yêu cầu (Request)
     // Types
     public static final int TYPE_DATA = 1;
     public static final int TYPE_ACK = 2;
@@ -54,6 +55,15 @@ public class ReliablePacket {
         p.payload = new byte[0];
         return p;
     }
+    // Tạo packet YÊU CẦU (Request)
+    public static ReliablePacket createRequest(int listenPort) {
+        ReliablePacket p = new ReliablePacket();
+        p.flags = (byte) FLAG_REQ;
+        p.aux16 = listenPort; // Client gửi port nghe của mình trong aux16
+        p.seqOrAck = 0;
+        p.payload = new byte[0];
+        return p;
+    }
     // serialize -> bytes (network order)
     public byte[] toBytes() {
         int headerLen = 8;
@@ -62,7 +72,7 @@ public class ReliablePacket {
         buffer.put(flags);
         buffer.put(control);
         buffer.putShort((short) (aux16 & 0xFFFF));
-        buffer.putInt((int) (aux16 & 0xFFFFFFFFL));
+        buffer.putInt((int) (seqOrAck & 0xFFFFFFFFL));
         if(payload != null) buffer.put(payload);
         return buffer.array();
     }

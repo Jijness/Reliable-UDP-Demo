@@ -6,13 +6,15 @@ import java.nio.file.Files;
 import java.nio.file.Paths;
 
 public class Utils {
+    private static final String BASE_PATH = "src/";
+    // read file to byte[]
     // read file to byte[]
     public static byte[] readFile(String path) throws IOException {
-        return Files.readAllBytes(Paths.get(path));
+        return Files.readAllBytes(Paths.get(BASE_PATH + path));
     }
     // write byte[] to file append
     public static void appendToFile(String path, byte[] data) throws IOException {
-        try (FileOutputStream fos = new FileOutputStream(path, true)) {
+        try (FileOutputStream fos = new FileOutputStream(BASE_PATH + path, true)) {
             fos.write(data);
         }
     }
