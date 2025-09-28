@@ -1,4 +1,4 @@
-package java.reliableudp;
+package reliableudp;
 
 import java.nio.ByteBuffer;
 
@@ -28,15 +28,14 @@ public class ReliablePacket {
     public static final byte FLAG_LAST = 0x1; // đánh dấu gói DATA cuối
 
     // ===== Trường header =====
-    public byte type;           // DATA/ACK/FIN/FIN-ACK
+    public byte type;           // DATA/ACK
     public byte flags;          // LAST cho DATA
     public int seq;             // sequence number
-    public short aux;           // DATA: length16; (ACK|FIN|FIN-ACK): checksum16(type,seq)
-    public long sendTs;         // timestamp ns (để đo)
+    public short aux;           // DATA: checksum
     public byte[] payload;      // null với ACK
 
 
-    public static final int HEADER_BYTES = 1 + 1 + 4 + 2 + 8;
+    public static final int HEADER_BYTES = 1 + 1 + 4 + 2;
     public static final int MAX_LEN16 = 0xFFFF;
 
 
@@ -49,13 +48,11 @@ public class ReliablePacket {
 
         // an toàn null
         p.payload = (payload == null) ? new byte[0] : payload;
-
         int len = p.payload.length;
         if (len > MAX_LEN16) {
             throw new IllegalArgumentException("payload too large for 16-bit length: " + len);
         }
-        p.aux = (short) (len & 0xFFFF);       // AUX = LENGTH(16b)
-        p.sendTs = System.nanoTime();
+        p.aux = checksum16Data(p.payload);       // AUX = LENGTH(16b)
         return p;
     }
 
@@ -66,19 +63,27 @@ public class ReliablePacket {
         p.type   = TYPE_ACK;
         p.flags  = 0;
         p.seq    = ackSeq;
-        p.aux    = checksum16(p.type, p.seq);
-        p.sendTs = System.nanoTime();
+        p.aux    = 0;
         p.payload = null;
         return p;
     }
 
-    // Checksum16 rất gọn: gộp hai nửa 16-bit của seq + type (8-bit) vào 16-bit
-    public static short checksum16(byte type, int seq) {
-        int a = (seq >>> 16) & 0xFFFF;
-        int b = seq & 0xFFFF;
-        int t = type & 0xFF;
-        int sum = a ^ b ^ t;             // XOR đơn giản (demo)
-        return (short)(sum & 0xFFFF);
+    /** DATA hợp lệ khi aux == checksum16Data(payload). */
+    public boolean validateDataChecksum() {
+        if (type != TYPE_DATA) return true;
+        return aux == checksum16Data(payload);
+    }
+
+    /** Checksum16 cho DATA: cộng 8-bit mở rộng (sum16) hoặc XOR; ở đây dùng sum16 đơn giản. */
+    public static short checksum16Data(byte[] data) {
+        int sum = 0;
+        if (data != null) {
+            for (byte b : data) {
+                sum += (b & 0xFF);
+                sum &= 0xFFFF; // giữ 16-bit
+            }
+        }
+        return (short) sum;
     }
 
 
@@ -87,20 +92,13 @@ public class ReliablePacket {
 
 
     public byte[] toBytes() {
-        int payloadLen = (type == TYPE_DATA) ? (aux & 0xFFFF) : 0;
-        int total = HEADER_BYTES + payloadLen;
-        ByteBuffer buf = ByteBuffer.allocate(total);
+        int payloadLen = (type == TYPE_DATA && payload != null) ? payload.length : 0;
+        ByteBuffer buf = ByteBuffer.allocate(HEADER_BYTES + payloadLen);
         buf.put(type);
         buf.put(flags);
         buf.putInt(seq);
         buf.putShort(aux);
-        buf.putLong(sendTs);
-        if (type == TYPE_DATA && payloadLen > 0) {
-            if (payload == null || payload.length != payloadLen) {
-                throw new IllegalStateException("payload length mismatch with aux");
-            }
-            buf.put(payload);
-        }
+        if (payloadLen > 0) buf.put(payload);
         return buf.array();
     }
 
@@ -113,7 +111,6 @@ public class ReliablePacket {
         p.flags = buf.get();
         p.seq = buf.getInt();
         p.aux = buf.getShort();
-        p.sendTs = buf.getLong();
 
         if (p.type == TYPE_DATA) {
             int len = Short.toUnsignedInt(p.aux); // AUX=LENGTH

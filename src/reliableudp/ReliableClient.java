@@ -1,7 +1,8 @@
-package java.reliableudp;
+package reliableudp;
+
+
 
 import channel.LossyChannel;
-
 import java.io.FileInputStream;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
@@ -41,10 +42,10 @@ public class ReliableClient {
         InetAddress addr = InetAddress.getByName(host);
         DatagramSocket socket = new DatagramSocket();
         socket.setSoTimeout(ReliablePacket.SOCKET_TIMEOUT_MS);
-        System.out.printf("Sender -> %s:%d | packets=%d | window=%d | timeout=%dms ", host, port, totalPackets, ReliablePacket.WINDOW_SIZE, ReliablePacket.TIMEOUT_MS);
+        System.out.printf("Sender -> %s:%d | packets=%d | window=%d | timeout=%dms \n", host, port, totalPackets, ReliablePacket.WINDOW_SIZE, ReliablePacket.TIMEOUT_MS);
 
         // Kênh mô phỏng: drop 5%, delay ≤ 30ms
-        LossyChannel ch = new LossyChannel(socket, /*lossRate*/ 0.3, /*delayMs*/ 0, 0.0);
+        LossyChannel ch = new LossyChannel(socket, /*lossRate*/ 0.3, /*delayMs*/ 0, 0.3);
 
         // Trạng thái SR
         base = 0; // seq nhỏ nhất chưa ACK
@@ -67,20 +68,14 @@ public class ReliableClient {
                     socket.receive(dp);
                     ReliablePacket ack = ReliablePacket.fromBytes(dp.getData(), dp.getLength());
                     if (ack.type == ReliablePacket.TYPE_ACK) {
-                        // verify aux là checksum16 cho ACK
-                        short expect = ReliablePacket.checksum16(ack.type, ack.seq);
-                        if (ack.aux != expect) {
-                            System.out.printf("!! BAD ACK CHKSUM seq=%d (got=0x%04X, exp=0x%04X) -> ignore%n",
-                                    ack.seq, Short.toUnsignedInt(ack.aux), Short.toUnsignedInt(expect));
-                            continue;
-                        }
+
                         int s = ack.seq;
                         if (s >= 0 && s < totalPackets && !acked[s]) {
                             acked[s] = true;
                             synchronized (acked) {
                                 while (base < totalPackets && acked[base]) base++;
                             }
-                            System.out.printf("<< RECV ACK   seq=%d, newBase=%d (aux=0x%04X)%n",
+                            System.out.printf("<< RECV ACK seq=%d, newBase=%d (aux=0x%04X)%n",
                                     s, base, Short.toUnsignedInt(ack.aux));
                         }
                     }

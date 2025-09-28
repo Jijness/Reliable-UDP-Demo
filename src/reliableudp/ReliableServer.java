@@ -1,4 +1,4 @@
-package java.reliableudp;
+package reliableudp;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -49,12 +49,16 @@ public class ReliableServer {
                 ReliablePacket p = ReliablePacket.fromBytes(dp.getData(), dp.getLength());
                 if (p.type != ReliablePacket.TYPE_DATA) continue;
 
+                if (!p.validateDataChecksum()) {
+                    System.out.printf("!! BAD DATA CHKSUM seq=%d -> NO ACK%n \n", p.seq);
+                    continue; // không ACK để buộc client retransmit
+                }
+
                 clientAddr = dp.getAddress();
                 clientPort = dp.getPort();
 
-                // Log nhận DATA hợp lệ (ở đây không dùng checksum payload nữa)
-                int len = Short.toUnsignedInt(p.aux); // AUX = LENGTH
-                System.out.printf("<< RECV DATA  seq=%d, bytes=%d, last=%b%n", p.seq, len, p.isLast());
+                // Log nhận DATA hợp lệ
+                System.out.printf("<< RECV DATA  seq=%d, bytes=%d, last=%b%n \n", p.seq, p.payload.length, p.isLast());
 
                 // Gửi ACK (AUX = checksum16 cho ACK)
                 sendAck(socket, p.seq, clientAddr, clientPort);
@@ -96,6 +100,6 @@ public class ReliableServer {
         byte[] b = ack.toBytes();
         DatagramPacket adp = new DatagramPacket(b, b.length, addr, port);
         socket.send(adp); // gửi trực tiếp
-        System.out.printf("<< SEND ACK   seq=%d (aux=0x%04X)%n", seq, Short.toUnsignedInt(ack.aux));
+        System.out.printf("<< SEND ACK seq=%d \n", seq);
     }
 }

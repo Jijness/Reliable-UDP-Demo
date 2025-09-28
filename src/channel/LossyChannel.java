@@ -1,4 +1,4 @@
-package java.channel;
+package channel;
 
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
