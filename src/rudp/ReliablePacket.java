@@ -18,7 +18,7 @@ public class ReliablePacket {
     public static final int FLAG_SYN = 1 << 5;
     public static final int FLAG_ACK = 1 << 4;
     public static final int FLAG_DATA = 1 << 3;
-    public static final int FlAG_SACK = 1 << 2;
+    public static final int FLAG_SACK = 1 << 2;
     public static final int FLAG_REQ = 1 << 1; // Cờ yêu cầu (Request)
     // Types
     public static final int TYPE_DATA = 1;
@@ -96,7 +96,7 @@ public class ReliablePacket {
         p.flags = buffer.get();
         p.control = buffer.get();
         p.checksum = (short) (buffer.getShort() & 0xFFFF);
-        p.seqOrAck = buffer.getInt() & 0xFFFF;
+        p.seqOrAck = buffer.getInt();
         int payloadLen = len - 8;
         if(payloadLen > 0) {
             p.payload = new byte[payloadLen];

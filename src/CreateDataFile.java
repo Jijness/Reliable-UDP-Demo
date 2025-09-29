@@ -7,7 +7,7 @@ import java.nio.file.Paths;
 public class CreateDataFile {
     private static final String FILENAME = "data_source.txt";
 
-    private static final int TARGET_SIZE_BYTES = 30 * 1024 * 1024;
+    private static final int TARGET_SIZE_BYTES = 5 * 1024 * 1024;
 
     // Đoạn văn bản mẫu
     private static final String CONTENT =

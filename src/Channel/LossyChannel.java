@@ -8,6 +8,8 @@ Tham số:
 */
 package Channel;
 
+import rudp.ReliablePacket;
+
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.util.Random;
@@ -31,8 +33,16 @@ public class LossyChannel {
     public void send(DatagramPacket packet) {
         double d = rnd.nextDouble();
         if (d < lossRate) {
-            Utils.log("LossyChannel: DROPPED packet to " + packet.getAddress() + ":" + packet.getPort());
+            try {
+                ReliablePacket rp = ReliablePacket.fromBytes(packet.getData(), packet.getLength());
+                Utils.log(String.format("LossyChannel: DROPPED to %s:%d type=%d seqOrAck=%d",
+                        packet.getAddress(), packet.getPort(), rp.getType(), rp.seqOrAck));
+            } catch (Exception e) {
+                Utils.log("LossyChannel: DROPPED (unparsable packet)");
+            }
             return;
+//            Utils.log("LossyChannel: DROPPED packet to " + packet.getAddress() + ":" + packet.getPort());
+//            return;
         }
         byte[] data = packet.getData();
         int offset = packet.getOffset();

@@ -1,9 +1,3 @@
-/*
-ReliableServer - sender:
-Usage:
- java com.example.rudp.ReliableServer <clientHost> <clientPort> <serverListenPort> <filePath> [lossRate]
- serverListenPort: nơi server cũng lắng nghe ACK (vì client sẽ gửi ACK về serverListenPort)
-*/
 package rudp;
 
 import Channel.LossyChannel;
@@ -17,9 +11,9 @@ import java.util.concurrent.*;
 
 public class ReliableServer {
     // cấu hình
-    private static final int SEGMENT_SIZE = 1000; // payload size per packet
+    private static final int SEGMENT_SIZE = 14000; // payload size per packet
     private static final int WINDOW_SIZE = 16;
-    private static final int RTO_MS = 500; // retransmission timeout
+    private static final int RTO_MS = 300; // retransmission timeout
     // Ngưỡng ACK trùng lặp cho Fast Retransmit (SR-ARQ Hint)
     private static final int DUP_ACK_THRESHOLD = 3;
 
@@ -34,6 +28,13 @@ public class ReliableServer {
     private final Set<Integer> acked = Collections.synchronizedSet(new HashSet<>());
     private final Map<Integer, Integer> dupAckCounts = new ConcurrentHashMap<>();
     private final ScheduledExecutorService timerExec = Executors.newScheduledThreadPool(8);
+
+    // hỗ trợ tránh spam retransmit / backoff
+    private final Set<Integer> inFlightRetrans = Collections.synchronizedSet(new HashSet<>());
+    private final Set<Integer> fastRetxed = Collections.synchronizedSet(new HashSet<>());
+    private final Map<Integer, Long> lastRetransmitTs = new ConcurrentHashMap<>();
+    private volatile int highestAckSeen = 0;
+    private static final long RETX_MIN_INTERVAL_MS = 150; // tối thiểu giữa 2 lần retransmit cho cùng seq
 
     private int baseSeq = 1;
     private int nextSeq = 1;
@@ -136,36 +137,64 @@ public class ReliableServer {
     private void sendSegment(int seq, boolean isRetransmit) {
         ReliablePacket p = segments.get(seq);
         if (p == null) return;
+        // avoid retransmitting too fast for same seq
+        long now = System.currentTimeMillis();
+        Long lastTs = lastRetransmitTs.get(seq);
+        if (isRetransmit && lastTs != null && now - lastTs < RETX_MIN_INTERVAL_MS) {
+            // skip; the RTO task will (maybe) reschedule later
+            return;
+        }
         byte[] buf = p.toBytes();
         DatagramPacket dp = new DatagramPacket(buf, buf.length, clientAddr, clientPort);
-        channel.send(dp);
-        sentCount++;
-        if (isRetransmit) retransCount++;
-
-        // schedule timer (cancel old one if exists)
+        // mark in-flight before sending to avoid duplicate sends from other threads
+        inFlightRetrans.add(seq);
+        try {
+            channel.send(dp);
+        } finally {
+            // note timestamp & stats
+            lastRetransmitTs.put(seq, System.currentTimeMillis());
+            sentCount++;
+            if (isRetransmit) {
+                retransCount++;
+                Utils.log("Server: retransmit seq=" + seq);
+            } else {
+                Utils.log("Server: send seq=" + seq);
+            }
+        }
+        // cancel old timer and schedule a fresh RTO for this seq
         ScheduledFuture<?> old = timers.get(seq);
         if (old != null) old.cancel(false);
         ScheduledFuture<?> fut = timerExec.schedule(() -> {
-            Utils.log("RTO: retransmit seq=" + seq);
-            sendSegment(seq, true);
+            synchronized (ReliableServer.this) {
+                // if already acked, skip
+                if (acked.contains(seq) || !segments.containsKey(seq)) {
+                    inFlightRetrans.remove(seq);
+                    timers.remove(seq);
+                    return;
+                }
+                Utils.log("RTO: timeout -> retransmit seq=" + seq);
+                // schedule retransmit (this call will update lastRetransmitTs and inFlight)
+                sendSegment(seq, true);
+                // clear inFlight (sendSegment will re-add)
+            }
         }, RTO_MS, TimeUnit.MILLISECONDS);
         timers.put(seq, fut);
+        // done: remove inFlight flag after scheduling timer so further callers can check
+        inFlightRetrans.remove(seq);
     }
 
     private void receiveAcks() {
-        byte[] buf = new byte[1500];
+        byte[] buf = new byte[15000];
         DatagramPacket dp = new DatagramPacket(buf, buf.length);
-
+        final Map<Integer,Integer> dupCounts = new HashMap<>();
         while (!socket.isClosed()) {
             try {
                 socket.setSoTimeout(500);
                 socket.receive(dp);
                 ReliablePacket rp = ReliablePacket.fromBytes(dp.getData(), dp.getLength());
                 if (rp.getType() != ReliablePacket.TYPE_ACK) continue;
-
                 int acknum = rp.seqOrAck;
-
-                // verify ACK checksum: compute checksum over (type + seq)
+                // verify ACK checksum
                 ByteBuffer bb = ByteBuffer.allocate(5);
                 bb.put((byte) ReliablePacket.TYPE_ACK);
                 bb.putInt(acknum);
@@ -174,51 +203,58 @@ public class ReliableServer {
                     Utils.log("Server: Bad ACK checksum for seq=" + acknum + " -> ignore");
                     continue;
                 }
-
+                Utils.log("Server: received ACK " + acknum);
                 synchronized (this) {
-                    // duplicate ack detection (ack for base-1)
-                    if (acknum == baseSeq - 1 && baseSeq > 1) {
-                        dupAckCounts.put(baseSeq, dupAckCounts.getOrDefault(baseSeq, 0) + 1);
-                        if (dupAckCounts.get(baseSeq) >= DUP_ACK_THRESHOLD) {
-                            Utils.log("FAST RETRANSMIT: Retransmitting seq=" + baseSeq);
-                            sendSegment(baseSeq, true);
-                            dupAckCounts.put(baseSeq, 0);
-                        }
-                        continue;
-                    }
-
-                    // mark the acked packet (selective)
+                    // mark selective
                     if (acknum >= 1 && acknum <= maxSeq) {
                         if (!acked.contains(acknum)) {
                             acked.add(acknum);
                             ScheduledFuture<?> f = timers.remove(acknum);
                             if (f != null) f.cancel(false);
+                            lastRetransmitTs.remove(acknum);
                         }
                     }
-
-                    // slide base while consecutive acked
+                    // slide base
                     while (acked.contains(baseSeq)) {
                         acked.remove(baseSeq);
                         segments.remove(baseSeq);
+                        timers.remove(baseSeq);
+                        fastRetxed.remove(baseSeq);
                         baseSeq++;
                     }
-
-                    // If ack indicates progress beyond missing items, do selective retransmit
-                    // Retransmit any missing seqs within current window up to the highest ack seen (acknum)
-                    if (acknum >= baseSeq) {
-                        int windowEnd = Math.min(baseSeq + WINDOW_SIZE - 1, maxSeq);
-                        for (int s = baseSeq; s <= windowEnd; s++) {
-                            if (!acked.contains(s)) {
+                    // update highestAckSeen (used to limit selective retransmit)
+                    if (acknum > highestAckSeen) highestAckSeen = acknum;
+                    // duplicate ack count per acknum
+                    int c = dupCounts.getOrDefault(acknum, 0) + 1;
+                    dupCounts.put(acknum, c);
+                    if (c >= DUP_ACK_THRESHOLD) {
+                        int missing = acknum + 1;
+                        if (missing <= maxSeq && !acked.contains(missing) && !fastRetxed.contains(missing)) {
+                            // fast retransmit ONCE for this missing seq
+                            Utils.log("FAST RETRANSMIT: Retransmitting seq=" + missing + " due to dup-acks for ack=" + acknum);
+                            sendSegment(missing, true);
+                            fastRetxed.add(missing);
+                        }
+                        dupCounts.put(acknum, 0); // reset for this acknum
+                    }
+                    // selective retransmit ONLY when acknum advances the highestAckSeen (i.e. progress)
+                    // retransmit missing between baseSeq..highestAckSeen if any (but limit to window)
+                    int windowEnd = Math.min(baseSeq + WINDOW_SIZE - 1, maxSeq);
+                    // Only do selective when highestAckSeen advanced beyond previous base (less repetitive)
+                    for (int s = baseSeq; s <= windowEnd; s++) {
+                        if (!acked.contains(s) && s <= highestAckSeen) {
+                            // avoid repeated immediate retransmits of same seq
+                            Long last = lastRetransmitTs.get(s);
+                            long now = System.currentTimeMillis();
+                            if (last == null || now - last >= RETX_MIN_INTERVAL_MS) {
                                 Utils.log("SELECTIVE-RETX: retransmit seq=" + s);
                                 sendSegment(s, true);
                             }
                         }
                     }
-
-                    // clear dup counters if window moved
-                    dupAckCounts.clear();
+                    // clear dupCounts for seqs < base (housekeeping)
+                    dupCounts.keySet().removeIf(k -> k < baseSeq);
                 }
-
             } catch (SocketTimeoutException ignored) {
                 // continue
             } catch (Exception e) {
@@ -229,7 +265,7 @@ public class ReliableServer {
     public static void main(String[] args) throws Exception {
         // Hardcoded: server listens on 5000, file "data_source.txt", default loss 10%
         int serverPort = 5000;
-        String filePath = "data_source.txt";
+        String filePath = "src/data_source.txt";
         double loss = 0.10;
 
         System.out.println("--- RUDP Server ---");

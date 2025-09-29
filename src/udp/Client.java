@@ -18,16 +18,11 @@ import java.util.Map;
 import java.util.TreeMap;
 
 public class Client {
-    // THAM SỐ MẶC ĐỊNH
-    private static final String DEFAULT_HOST = "127.0.0.1";
-    private static final int DEFAULT_PORT = 5000;
-    private static final int DEFAULT_TIMEOUT_MS = 5000;
-
     private final int listenPort;
     private final String outFile;
-    private final DatagramSocket socket;
     private final InetAddress serverAddr;
     private final int serverPort;
+    private final DatagramSocket socket;
 
     private final Map<Integer, byte[]> buffer = new TreeMap<>(); // giữ out-of-order
     private int highestSeq = 0;
@@ -53,78 +48,62 @@ public class Client {
         }
     }
 
-    public void receiveAndWrite(int waitMs) throws IOException {
-        // Bắt tay khởi tạo
+    public void startReceiving() throws IOException {
         sendRequest();
-
-        Utils.log("UDP Client: listening on " + listenPort);
+        Utils.log("UDP Client: listening on port " + listenPort);
         byte[] buf = new byte[1500];
         DatagramPacket dp = new DatagramPacket(buf, buf.length);
-
-        long startTime = System.currentTimeMillis();
+        long start = System.currentTimeMillis();
         long totalBytes = 0;
 
         while (true) {
-            socket.setSoTimeout(waitMs);
-            try {
-                socket.receive(dp);
-                int len = dp.getLength();
-                if (len < 4) continue;
-                ByteBuffer bb = ByteBuffer.wrap(dp.getData(), 0, len);
-                int seq = bb.getInt();
-                byte[] payload = new byte[len - 4];
-                bb.get(payload);
-
-                if (!buffer.containsKey(seq)) {
-                    buffer.put(seq, payload);
-                    uniqueReceived++;
-                    totalBytes += payload.length;
-                    if (seq > highestSeq) highestSeq = seq;
-                }
-
-            } catch (java.net.SocketTimeoutException st) {
-                Utils.log("UDP Client: timeout waiting. stopping receive.");
+            socket.receive(dp);
+            ByteBuffer bb = ByteBuffer.wrap(dp.getData(), 0, dp.getLength());
+            int seq = bb.getInt();
+            if (seq == -1) { // FIN
+                Utils.log("UDP Client: Received FIN. Stopping.");
                 break;
             }
-        }
-        // GHI TOÀN BỘ DỮ LIỆU ĐÃ NHẬN (KỂ CẢ CÁC GÓI BỊ MẤT GIỮA CHỪNG)
-        // Sẽ tạo ra 1 file KHÔNG LIÊN TỤC (có thể thiếu/lỗi), nhưng phản ánh đúng số byte nhận được
-        try (FileOutputStream fos = new FileOutputStream(outFile)) { // Không dùng append (false)
-            int maxSeq = highestSeq;
-            Utils.log("UDP Client: Writing all received data to file...");
-            for (int seq = 1; seq <= maxSeq; seq++) {
-                byte[] chunk = buffer.get(seq);
-                if (chunk != null) {
-                    fos.write(chunk);
-                }
+            byte[] payload = new byte[dp.getLength() - 4];
+            bb.get(payload);
+            if (!buffer.containsKey(seq)) {
+                buffer.put(seq, payload);
+                uniqueReceived++;
+                totalBytes += payload.length;
+                if (seq > highestSeq) highestSeq = seq;
             }
         }
-        socket.close();
 
-        long endTime = System.currentTimeMillis();
+        try (FileOutputStream fos = new FileOutputStream(outFile)) {
+            for (int i = 1; i <= highestSeq; i++) {
+                byte[] chunk = buffer.get(i);
+                if (chunk != null) fos.write(chunk);
+            }
+        }
 
-        // print summary
-        int lossCount = (highestSeq == 0) ? 0 : (highestSeq - uniqueReceived);
+        long end = System.currentTimeMillis();
+        int loss = (highestSeq - uniqueReceived);
         Utils.log("--- TRANSFER SUMMARY (UDP) ---");
-        Utils.log(String.format("File size received: %.2f KB", totalBytes / 1024.0));
-        Utils.log("Highest Seq Received: " + highestSeq);
-        Utils.log("Unique Packets Received: " + uniqueReceived);
-        Utils.log("Approx. Loss Count: " + lossCount);
-        Utils.log(String.format("Time taken: %.2f s", (endTime - startTime) / 1000.0));
-        Utils.log("----------------------------");
+        Utils.log(String.format("File: %s", outFile));
+        Utils.log(String.format("Total data: %.2f KB", totalBytes / 1024.0));
+        Utils.log("Highest Seq: " + highestSeq);
+        Utils.log("Unique Packets: " + uniqueReceived);
+        Utils.log("Approx Loss: " + loss);
+        Utils.log(String.format("Time: %.2f s", (end - start) / 1000.0));
+        Utils.log("-----------------------------");
+
+        socket.close();
     }
 
     public static void main(String[] args) throws Exception {
-        String out = "received_udp.txt"; // File đầu ra
+        String out = "src/received_udp.txt"; // File đầu ra
         int listenPort = 5003; // Client lắng nghe trên port 5001
         String host = "127.0.0.1";
         int port = 5002; // Server lắng nghe trên port 5000
-        int waitMs = 10000; // Thời gian chờ (10s)
-
         System.out.println("--- UDP Client (Tự động) ---");
-        System.out.println(String.format("Out File: %s, Listen Port: %d, Server: %s:%d, Timeout: %dms", out, listenPort, host, port, waitMs));
+        System.out.println(String.format("Out File: %s, Listen Port: %d, Server: %s:%d", out, listenPort, host, port));
 
         Client c = new Client(listenPort, out, host, port);
-        c.receiveAndWrite(waitMs);
+        c.startReceiving();
     }
 }

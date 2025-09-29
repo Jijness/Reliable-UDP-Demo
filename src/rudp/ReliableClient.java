@@ -1,11 +1,3 @@
-/*
-ReliableClient - receiver:
-Usage:
-java com.example.rudp.ReliableClient <listenPort> <outputFile> <serverHost> <serverPort>
-client listens on listenPort for DATA, write to outputFile incrementally,
-sends ACKs to serverHost:serverPort (serverListenPort).
-*/
-
 package rudp;
 
 import Channel.Utils;
@@ -55,7 +47,7 @@ public class ReliableClient {
         Utils.clearFile(outFile);
         sendRequest();
         Utils.log("Client: Listening on port " + listenPort + " for DATA...");
-        byte[] buf = new byte[1500];
+        byte[] buf = new byte[15000];
         DatagramPacket dp = new DatagramPacket(buf, buf.length);
         long startTime = System.currentTimeMillis();
         long totalBytes = 0;
@@ -89,24 +81,19 @@ public class ReliableClient {
                     Utils.log("Client: DATA checksum mismatch seq=" + seq + " -> ignore");
                     continue;
                 }
-                // duplicate (already delivered)
                 if (seq < expectedSeq) {
-                    // send ACK for already-received (helps fast-retransmit on sender)
+                    Utils.log("Client: received DUPLICATE DATA seq=" + seq + " -> resend ACK " + (expectedSeq - 1));
                     sendAck(expectedSeq - 1);
-                    continue;
-                }
-                // if inside window, buffer it
-                if (seq >= expectedSeq && seq < expectedSeq + ReliablePacket.WINDOW_SIZE) {
+                } else if (seq >= expectedSeq && seq < expectedSeq + ReliablePacket.WINDOW_SIZE) {
                     if (!buffer.containsKey(seq)) {
+                        Utils.log("Client: received NEW DATA seq=" + seq + " (len=" + rp.payload.length + ")");
                         buffer.put(seq, rp.payload);
                         totalBytes += rp.payload.length;
+                    } else {
+                        Utils.log("Client: received OUT-OF-ORDER (already buffered) seq=" + seq + " (len=" + rp.payload.length + ")");
                     }
-                } else {
-                    // outside window (too far) -> ignore
-                    continue;
+                    sendAck(seq);
                 }
-                // send selective ACK for this packet
-                sendAck(seq);
                 // flush contiguous
                 boolean flushed = false;
                 try (FileOutputStream fos = new FileOutputStream(outFile, true)) {
@@ -141,7 +128,7 @@ public class ReliableClient {
     }
 
     public static void main(String[] args) throws Exception {
-        String outFile = "received_rudp.txt"; // File đầu ra
+        String outFile = "src/received_rudp.txt"; // File đầu ra
         int listenPort = 5001; // Client lắng nghe trên port 5001
         String serverHost = "127.0.0.1";
         int serverPort = 5000; // Server lắng nghe trên port 5000
